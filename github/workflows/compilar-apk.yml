@@ -1,1 +1,179 @@
-
+# Ateliê 2.0 — um workflow, hub completo ou APKs individuais.
+# Requer atelie-source.zip NA RAIZ do repositório (incluído na entrega).
+# Extraia o ZIP da entrega, mas mantenha atelie-source.zip compactado.
+name: Compilar Ateliê APK
+on:
+  workflow_dispatch:
+    inputs:
+      pacote:
+        description: Quais APKs gerar?
+        type: choice
+        options: [hub, individuais, todos]
+        default: hub
+        required: true
+  push:
+    paths:
+      - '.github/workflows/compilar-apk.yml'
+      - 'atelie-source.zip'
+permissions:
+  contents: read
+concurrency:
+  group: atelie-${{ github.ref }}
+  cancel-in-progress: true
+jobs:
+  validar:
+    name: Validar projeto e renderizar prévias
+    runs-on: ubuntu-22.04
+    timeout-minutes: 35
+    outputs:
+      familias: ${{ steps.selecao.outputs.familias }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - uses: actions/checkout@v4
+      - name: Extrair projeto
+        run: |
+          test -f atelie-source.zip
+          mkdir -p app
+          unzip -q atelie-source.zip -d app
+          chmod +x app/android/gradlew
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.29.3'
+          channel: stable
+          cache: true
+      - name: Restaurar chave de demonstração
+        uses: actions/cache@v4
+        with:
+          path: ~/.android/debug.keystore
+          key: violeta-demo-key-v1-${{ github.repository_id }}
+      - name: Preparar assinatura reutilizável
+        run: |
+          mkdir -p "$HOME/.android"
+          if [ ! -f "$HOME/.android/debug.keystore" ]; then
+            keytool -genkeypair -keystore "$HOME/.android/debug.keystore" \
+              -storepass android -keypass android -alias androiddebugkey \
+              -dname 'CN=Android Debug,O=Android,C=US' -keyalg RSA -keysize 2048 -validity 10000
+          fi
+      - name: Resolver dependências e analisar
+        working-directory: app
+        run: |
+          flutter pub get
+          dart format lib
+          flutter analyze --no-fatal-infos
+      - name: Testar fluxos, modos, persistência e renderização
+        working-directory: app
+        run: |
+          set -o pipefail
+          flutter test --reporter expanded --concurrency=1 2>&1 | tee ../flutter-tests.log
+      - name: Disponibilizar log e prévias
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: Diagnostico-e-Previas
+          path: |
+            flutter-tests.log
+            app/previews/
+            app/test/
+          if-no-files-found: warn
+          retention-days: 14
+      - name: Escolher edições
+        id: selecao
+        env:
+          PACOTE: ${{ inputs.pacote || 'hub' }}
+        run: |
+          python3 - <<'PY'
+          import json, os
+          individual=['nubank','bb','next','bradesco','pagbank','binance','cooperativa']
+          mode=os.environ['PACOTE']
+          families=['all'] if mode=='hub' else individual if mode=='individuais' else ['all']+individual
+          with open(os.environ['GITHUB_OUTPUT'],'a') as output:
+              output.write('familias='+json.dumps(families)+'\n')
+          PY
+      - name: Empacotar projeto validado
+        working-directory: app
+        run: |
+          python3 - <<'PY'
+          from pathlib import Path
+          from zipfile import ZipFile,ZIP_DEFLATED
+          roots=['lib','assets','test','android','tool']
+          with ZipFile('../projeto-validado.zip','w',ZIP_DEFLATED) as archive:
+              for root in roots:
+                  for file in Path(root).rglob('*'):
+                      if file.is_file() and '.gradle' not in file.parts and file.name!='local.properties':
+                          archive.write(file,str(file))
+              for name in ['pubspec.yaml','pubspec.lock','analysis_options.yaml']:
+                  archive.write(name,name)
+          PY
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Codigo-Flutter-Validado
+          path: projeto-validado.zip
+          if-no-files-found: error
+          retention-days: 30
+  compilar:
+    name: APK · ${{ matrix.familia }}
+    needs: validar
+    runs-on: ubuntu-22.04
+    timeout-minutes: 40
+    strategy:
+      fail-fast: false
+      max-parallel: 3
+      matrix:
+        familia: ${{ fromJSON(needs.validar.outputs.familias) }}
+    env:
+      STUDY_FAMILY: ${{ matrix.familia }}
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: Codigo-Flutter-Validado
+          path: projeto
+      - name: Extrair projeto validado
+        run: |
+          mkdir -p app
+          unzip -q projeto/projeto-validado.zip -d app
+          chmod +x app/android/gradlew
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - uses: android-actions/setup-android@v3
+      - uses: subosito/flutter-action@v2
+        with:
+          flutter-version: '3.29.3'
+          channel: stable
+          cache: true
+      - uses: actions/cache/restore@v4
+        with:
+          path: ~/.android/debug.keystore
+          key: violeta-demo-key-v1-${{ github.repository_id }}
+          fail-on-cache-miss: true
+      - name: Configurar edição e SDK
+        working-directory: app
+        run: |
+          python3 tool/select-edition.py
+          sdkmanager 'platforms;android-35' 'build-tools;35.0.0' 'ndk;27.0.12077973'
+          flutter pub get
+      - name: Compilar e verificar assinatura
+        working-directory: app
+        run: |
+          flutter build apk --release --dart-define="STUDY_FAMILY=$STUDY_FAMILY"
+          mkdir -p ../entrega
+          cp build/app/outputs/flutter-apk/app-release.apk "../entrega/atelie-$STUDY_FAMILY.apk"
+          "$ANDROID_HOME/build-tools/35.0.0/apksigner" verify --verbose "../entrega/atelie-$STUDY_FAMILY.apk"
+          cd ../entrega
+          sha256sum *.apk > SHA256SUMS.txt
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Atelie-APK-${{ matrix.familia }}
+          path: entrega/
+          if-no-files-found: error
+          retention-days: 30
+      - name: Resumo
+        run: |
+          printf '### APK gerado: %s\nBaixe o artefato **Atelie-APK-%s**.\n' "$STUDY_FAMILY" "$STUDY_FAMILY" >> "$GITHUB_STEP_SUMMARY"
